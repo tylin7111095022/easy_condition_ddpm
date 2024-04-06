@@ -8,14 +8,16 @@ Everything is self contained. (Except for pytorch and torchvision... of course)
 run it with `python superminddpm.py`
 """
 
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 from tqdm import tqdm
 import os
+import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from torchvision.datasets import CIFAR10, MNIST
 
 from torchvision import transforms
 from torchvision.utils import save_image, make_grid
@@ -67,16 +69,17 @@ class EmbedFC(nn.Module):
         generic one layer FC NN for embedding things  
         '''
         self.input_dim = input_dim
+        self.emb_dim = emb_dim
         layers = [
             nn.Linear(input_dim, emb_dim),
             nn.GELU(),
             nn.Linear(emb_dim, emb_dim),
         ]
-        self.model = nn.Sequential(*layers)
+        self.block = nn.Sequential(*layers)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor):
         x = x.view(-1, self.input_dim)
-        return self.model(x)
+        return self.block(x)
     
 class Dconv(nn.Module):
     def __init__(self, inc, outc, downsampling:bool=False):
@@ -105,7 +108,7 @@ class Uconv(nn.Module):
         super(Uconv,self).__init__()
         self.inc = inc
         self.outc = outc
-        self.up = nn.ConvTranspose2d(inc, outc,3,2)
+        self.up = nn.ConvTranspose2d(inc, outc,2,2)
         self.double_conv = Dconv(inc = 2*outc,outc=outc)
 
     def forward(self, x, enc_f):
@@ -120,40 +123,71 @@ class Uconv(nn.Module):
         return self.double_conv(f)
 
 class SimpleUnet(nn.Module):
-    """
-    This should be unet-like, but let's don't think about the model too much :P
-    Basically, any universal R^n -> R^n model should work.
-    """
-    def __init__(self, in_channel: int, channels:list=[48,96,192,384]) -> None:
+    
+    def __init__(self, in_channel: int, channels:list=[48,96,192,384], is_condition:bool=False) -> None:
         """in channel is equal to channel of condition channel concat channel of image channel"""
         super(SimpleUnet, self).__init__()
         self.in_channel = in_channel
         self.everychannels = channels
+        self.is_condition = is_condition
         self.everychannels.insert(0,in_channel)
         self.encoder = nn.ModuleList([Dconv(inc=self.everychannels[i],outc=self.everychannels[i+1],downsampling=True) for i in range(len(self.everychannels)-1)])
         self.hiddenconv = Dconv(inc=self.everychannels[-1],outc=self.everychannels[-1],downsampling=False)
         self.decoder = nn.ModuleList([Uconv(inc=self.everychannels[i],outc=self.everychannels[i-1]) for i in range(len(self.everychannels)-1,0,-1)])
-        self.out_conv = nn.Conv2d(channels[0],in_channel//2,1,1,0) # because in_channel equal to orig_img and condtion image concat at channel axis.
+        self.out_channel = in_channel//2 if self.is_condition else in_channel
+        self.out_conv = nn.Conv2d(channels[0],self.out_channel,1,1,0)  # because in_channel equal to orig_img and condtion image concat at channel axis.
         self.t_embeddings = nn.ModuleList([EmbedFC(input_dim=1,emb_dim=c) for c in self.everychannels])
 
     def forward(self, x, t, condition) -> torch.Tensor:
         # Lets think about using t later. In the paper, they used Tr-like positional embeddings.
 
         t_embeddings = [embed(t)[:,:, None, None] for embed in self.t_embeddings]
-        x1 = torch.concat([x,condition], dim=1) + t_embeddings[0]
+        if condition is not None:
+            x1 = torch.concat([x,condition], dim=1) + t_embeddings[0]
+        else: 
+            x1 = x + t_embeddings[0]
+
         h = x1
         for i, e in enumerate(self.encoder):
             h = e(h) + t_embeddings[i+1]
         h = self.hiddenconv(h)
         # decoder
         h = self.decoder[0](h,self.encoder[-2].fmap) + t_embeddings[-2]
-        h = self.decoder[1](h,self.encoder[-3].fmap) + t_embeddings[-3]
-        h = self.decoder[2](h,self.encoder[-4].fmap) + t_embeddings[-4]
+        h = self.decoder[1](h,self.encoder[-3].fmap)
+        h = self.decoder[2](h,self.encoder[-4].fmap)
         noise = self.decoder[3](h,x1)
 
         noise = self.out_conv(noise)
 
         return noise
+    
+class DummyEpsModel(nn.Module):
+    """
+    This should be unet-like, but let's don't think about the model too much :P
+    Basically, any universal R^n -> R^n model should work.
+    """
+
+    def __init__(self, n_channel: int) -> None:
+        super(DummyEpsModel, self).__init__()
+        blk = lambda ic, oc: nn.Sequential(
+        nn.Conv2d(ic, oc, 7, padding=3),
+        nn.BatchNorm2d(oc),
+        nn.LeakyReLU(),
+        )
+        self.conv = nn.Sequential(  # with batchnorm
+            blk(n_channel, 64),
+            blk(64, 128),
+            blk(128, 256),
+            blk(256, 512),
+            blk(512, 256),
+            blk(256, 128),
+            blk(128, 64),
+            nn.Conv2d(64, n_channel, 3, padding=1),
+        )
+
+    def forward(self, x, t, condition:torch.Tensor= None) -> torch.Tensor:
+        # Lets think about using t later. In the paper, they used Tr-like positional embeddings.
+        return self.conv(x)
 
 class DDPM(nn.Module):
     def __init__(
@@ -173,7 +207,7 @@ class DDPM(nn.Module):
         self.n_T = n_T
         self.criterion = criterion
 
-    def forward(self, x: torch.Tensor, condition:torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, condition:torch.Tensor= None) -> torch.Tensor:
         """
         Makes forward diffusion x_t, and tries to guess epsilon value from x_t using eps_model.
         This implements Algorithm 1 in the paper.
@@ -195,11 +229,12 @@ class DDPM(nn.Module):
 
         return self.criterion(eps, self.eps_model(x_t, _ts / self.n_T, condition=condition))
 
-    def sample(self, n_sample: int,size, condition:torch.Tensor, device) -> torch.Tensor:
+    def sample(self, n_sample: int,size, condition:torch.Tensor=None, device:str="cuda:0") -> torch.Tensor:
         """生成乾淨的圖 推論過程"""
         x_i = torch.randn(n_sample, *size).to(device)  # x_T ~ N(0, 1)
-        assert condition.shape[0] == n_sample, "batch size dismatch"
-        assert condition.shape[1] == size[0] and condition.shape[2] == size[1] and condition.shape[3] == size[2], f"dimension dismatch, condition:{condition.shape}"
+        if condition is not None:
+            assert condition.shape[0] == n_sample, "batch size dismatch"
+            assert condition.shape[1] == size[0] and condition.shape[2] == size[1] and condition.shape[3] == size[2], f"dimension dismatch, condition:{condition.shape}"
 
         # print(f"x_i shape: {x_i.shape}")
 
@@ -209,6 +244,7 @@ class DDPM(nn.Module):
             t = i / self.n_T
             if isinstance(t,float):
                 t = torch.tensor([t]).to(device)
+            
             eps = self.eps_model(x_i, t, condition)
             x_i = (
                 self.oneover_sqrta[i] * (x_i - eps * self.mab_over_sqrtmab[i])
@@ -219,14 +255,19 @@ class DDPM(nn.Module):
         return x_i
 
 
-def train_aicup(n_epoch: int = 1000, batch:int=50, sample_num:int=4, device="cuda:0") -> None:
+def train_aicup(n_epoch: int = 1000, batch:int=50, sample_num:int=4, device="cuda:0",load_pth: Optional[str] = None) -> None:
     if not os.path.exists("./contents"):
         os.makedirs("./contents")
-    ddpm = DDPM(eps_model=SimpleUnet(6), betas=(1e-4, 0.02), n_T=1000)
+    ddpm = DDPM(eps_model=SimpleUnet(6,is_condition=True), betas=(1e-4, 0.02), n_T=1000)
+
+    if load_pth:
+        ddpm.load_state_dict(torch.load(load_pth))
+        print("load weight at %s." % load_pth)
+
     ddpm.to(device)
 
     dataset = AICUPDataset(data_root=r"data\Training_dataset\img",condition_root=r"data\Training_dataset\label_img")
-    dataloader = DataLoader(dataset, batch_size=batch, shuffle=True, num_workers=0)
+    dataloader = DataLoader(dataset, batch_size=batch, shuffle=True, num_workers=0,drop_last=False)
     optim = torch.optim.Adam(ddpm.parameters(), lr=2e-4)
     total_iters = ((len(dataset) // batch)+1)*n_epoch
     i_iter = 0
@@ -245,7 +286,7 @@ def train_aicup(n_epoch: int = 1000, batch:int=50, sample_num:int=4, device="cud
                 loss_ema = loss.item()
             else:
                 loss_ema = 0.9 * loss_ema + 0.1 * loss.item()
-            pbar.set_description(f"epoch: {i+1}, i_iter: {i_iter}, loss: {loss_ema:.4f}")
+            pbar.set_description(f"epoch: {i+1}, i_iter: {i_iter+1}/{total_iters}, loss: {loss_ema:.4f}")
             optim.step()
             i_iter += 1
 
@@ -256,12 +297,67 @@ def train_aicup(n_epoch: int = 1000, batch:int=50, sample_num:int=4, device="cud
             xh = ddpm.sample(sample_num, (3, 120, 214),cond_img, device)
             xset = torch.concat([gt,cond_img,xh],dim=0)
             grid = make_grid(xset, nrow=sample_num)
-            save_image(grid, f"./contents/ddpm_sample_{i}.png")
+            save_image(grid, f"./contents/ddpm_sample_{i+1}.png")
             
             # save model
             if i % 50 == 0:
-                torch.save(ddpm.state_dict(), f"./contents/ddpm_aicup_{i}.pth")
+                torch.save(ddpm.state_dict(), f"./contents/ddpm_aicup_{i+1}.pth")
+    torch.save(ddpm.state_dict(), f"./contents/ddpm_aicup_last.pth")
 
+    return
+
+def train_cifar10(n_epoch: int = 100, batch:int=100, sample_num:int=4, device="cuda:0") -> None:
+    if not os.path.exists("./cifar10"):
+        os.makedirs("./cifar10")
+    ddpm = DDPM(eps_model=DummyEpsModel(3), betas=(1e-4, 0.02), n_T=1000)
+    ddpm.to(device)
+
+    tf = transforms.Compose(
+        [transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))]
+    )
+
+    dataset = CIFAR10(
+        "./data",
+        train=True,
+        download=True,
+        transform=tf,
+    )
+
+    dataloader = DataLoader(dataset, batch_size=batch, shuffle=True, num_workers=0)
+    optim = torch.optim.Adam(ddpm.parameters(), lr=2e-4)
+    total_iters = ((len(dataset) // batch)+1)*n_epoch
+    i_iter = 0
+    for i in range(n_epoch):
+        ddpm.train()
+        pbar = tqdm(dataloader)
+        loss_ema = None
+        for x_gt, _ in pbar:
+            set_lr(optim, init_lr=2e-4,last_lr=2e-6,total_iter=total_iters//2,cur_iter=i_iter)
+            x_gt = x_gt.to(device)
+            optim.zero_grad()
+            loss = ddpm(x_gt)
+            loss.backward()
+            if loss_ema is None:
+                loss_ema = loss.item()
+            else:
+                loss_ema = 0.9 * loss_ema + 0.1 * loss.item()
+            pbar.set_description(f"epoch: {i+1}, i_iter: {i_iter+1}/{total_iters}, loss: {loss_ema:.4f}")
+            optim.step()
+            i_iter += 1
+
+        ddpm.eval()
+        with torch.no_grad():
+            gt = x_gt[:sample_num]
+            xh = ddpm.sample(sample_num, (3, 32, 32), device=device)
+            xset = torch.concat([gt,xh],dim=0)
+            grid = make_grid(xset, nrow=sample_num)
+            save_image(grid, f"./cifar10/cifar10_{i}.png")
+            
+            # save model
+            if i % 10 == 0:
+                torch.save(ddpm.state_dict(), f"./cifar10/cifar10_{i+1}.pth")
+
+    return
 
 if __name__ == "__main__":
-    train_aicup(n_epoch=1500,batch=45,sample_num=4)
+    train_aicup(n_epoch=1200,batch=50,sample_num=4,load_pth=r"")

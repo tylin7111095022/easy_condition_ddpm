@@ -5,3 +5,4 @@ ddpm*.png
 .env
 contents
 experiments
+cifar10
