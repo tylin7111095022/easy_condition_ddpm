@@ -8,7 +8,7 @@ Everything is self contained. (Except for pytorch and torchvision... of course)
 run it with `python superminddpm.py`
 """
 
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 from tqdm import tqdm
 import os
 import math
@@ -109,7 +109,7 @@ class Uconv(nn.Module):
         super(Uconv,self).__init__()
         self.inc = inc
         self.outc = outc
-        self.up = nn.ConvTranspose2d(inc, outc,3,2)
+        self.up = nn.ConvTranspose2d(inc, outc,2,2)
         self.double_conv = Dconv(inc = 2*outc,outc=outc)
 
     def forward(self, x, enc_f):
@@ -124,10 +124,7 @@ class Uconv(nn.Module):
         return self.double_conv(f)
 
 class SimpleUnet(nn.Module):
-    """
-    This should be unet-like, but let's don't think about the model too much :P
-    Basically, any universal R^n -> R^n model should work.
-    """
+
     def __init__(self, in_channel: int, channels:list=[48,96,192,384], is_condition:bool=False) -> None:
         """in channel is equal to channel of condition channel concat channel of image channel"""
         super(SimpleUnet, self).__init__()
@@ -259,14 +256,19 @@ class DDPM(nn.Module):
         return x_i
 
 
-def train_aicup(n_epoch: int = 1000, batch:int=50, sample_num:int=4, device="cuda:0") -> None:
+def train_aicup(n_epoch: int = 1000, batch:int=50, sample_num:int=4, device="cuda:0",load_pth: Optional[str] = None) -> None:
     if not os.path.exists("./contents"):
         os.makedirs("./contents")
     ddpm = DDPM(eps_model=SimpleUnet(6,is_condition=True), betas=(1e-4, 0.02), n_T=1000)
+
+    if load_pth:
+        ddpm.load_state_dict(torch.load(load_pth))
+        print("load weight at %s." % load_pth)
+
     ddpm.to(device)
 
     dataset = AICUPDataset(data_root=r"data\Training_dataset\img",condition_root=r"data\Training_dataset\label_img")
-    dataloader = DataLoader(dataset, batch_size=batch, shuffle=True, num_workers=0)
+    dataloader = DataLoader(dataset, batch_size=batch, shuffle=True, num_workers=0,drop_last=False)
     optim = torch.optim.Adam(ddpm.parameters(), lr=2e-4)
     total_iters = ((len(dataset) // batch)+1)*n_epoch
     i_iter = 0
@@ -285,7 +287,7 @@ def train_aicup(n_epoch: int = 1000, batch:int=50, sample_num:int=4, device="cud
                 loss_ema = loss.item()
             else:
                 loss_ema = 0.9 * loss_ema + 0.1 * loss.item()
-            pbar.set_description(f"epoch: {i+1}, i_iter: {i_iter}, loss: {loss_ema:.4f}")
+            pbar.set_description(f"epoch: {i+1}, i_iter: {i_iter+1}/{total_iters}, loss: {loss_ema:.4f}")
             optim.step()
             i_iter += 1
 
@@ -296,11 +298,12 @@ def train_aicup(n_epoch: int = 1000, batch:int=50, sample_num:int=4, device="cud
             xh = ddpm.sample(sample_num, (3, 120, 214),cond_img, device)
             xset = torch.concat([gt,cond_img,xh],dim=0)
             grid = make_grid(xset, nrow=sample_num)
-            save_image(grid, f"./contents/ddpm_sample_{i}.png")
+            save_image(grid, f"./contents/ddpm_sample_{i+1}.png")
             
             # save model
             if i % 50 == 0:
-                torch.save(ddpm.state_dict(), f"./contents/ddpm_aicup_{i}.pth")
+                torch.save(ddpm.state_dict(), f"./contents/ddpm_aicup_{i+1}.pth")
+    torch.save(ddpm.state_dict(), f"./contents/ddpm_aicup_last.pth")
 
     return
 
@@ -339,7 +342,8 @@ def train_cifar10(n_epoch: int = 100, batch:int=100, sample_num:int=4, device="c
                 loss_ema = loss.item()
             else:
                 loss_ema = 0.9 * loss_ema + 0.1 * loss.item()
-            pbar.set_description(f"epoch: {i+1}, i_iter: {i_iter}, loss: {loss_ema:.4f}")
+
+            pbar.set_description(f"epoch: {i+1}, i_iter: {i_iter+1}/{total_iters}, loss: {loss_ema:.4f}")
             optim.step()
             i_iter += 1
 
@@ -358,5 +362,4 @@ def train_cifar10(n_epoch: int = 100, batch:int=100, sample_num:int=4, device="c
     return
 
 if __name__ == "__main__":
-    train_aicup(n_epoch=1000,batch=45,sample_num=4)
-    # train_cifar10(n_epoch=200,batch=100,sample_num=4)
+    train_aicup(n_epoch=1200,batch=50,sample_num=4,load_pth=r"")
